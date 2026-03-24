@@ -5,6 +5,7 @@ import base64
 import json
 import asyncio
 import ssl
+import threading
 from urllib.parse import urlencode
 from abc import ABC, abstractmethod
 from requests.models import HTTPBasicAuth
@@ -55,6 +56,12 @@ class SignalCliRestApi(object):
             self._auth = None
 
         self._mode = self.mode() # init mode for receive with websockets
+
+        # WebSocket background listener state
+        self._ws_queue: asyncio.Queue | None = None
+        self._ws_loop: asyncio.AbstractEventLoop | None = None
+        self._ws_thread: threading.Thread | None = None
+        self._ws_listener_params: dict = {}  # params used when the listener was started
     
     def _format_params(self, params, endpoint:str=None): #TODO should this be called from _requester to reduce reduncancy?
         """Format parameters/args/data for API calls.
@@ -436,38 +443,33 @@ class SignalCliRestApi(object):
                 headers["Authorization"] = f"Basic {token}"
         return headers
 
-    async def receive_ws(
+    async def _ws_listener(
             self,
             ignore_attachments: bool = False,
             ignore_stories: bool = False,
             send_read_receipts: bool = False,
-            max_messages: int | None = None,
-            timeout: int = 1,
-    ) -> list:
+    ) -> None:
         """
-        Receive messages via websocket (json-rpc mode).
+        Persistent background coroutine that maintains a WebSocket connection and
+        pushes every received message into self._ws_queue.
 
-        Collects messages until:
-          - max_messages is reached, OR
-          - no message arrives for `timeout` seconds (silence timeout)
-
-        Returns:
-            list: list of received message envelopes (dicts)
+        Reconnects automatically on connection loss. Runs until the event loop is
+        stopped (i.e. stop_ws_listener() is called).
         """
         try:
-            import websockets  # dependency already in pyproject
+            import websockets
+            import websockets.exceptions
         except Exception as exc:
             raise_from(
                 SignalCliRestApiError("websockets package is required for json-rpc receive"),
                 exc,
             )
 
+        # Build URL without max_messages / timeout — the listener runs indefinitely.
         params = {
             "ignore_attachments": ignore_attachments,
             "ignore_stories": ignore_stories,
             "send_read_receipts": send_read_receipts,
-            "max_messages": max_messages,
-            "timeout": timeout,
         }
         data = self._format_params(params=params, endpoint="receive")
         ws_url = self._ws_url_for_receive(data)
@@ -479,36 +481,162 @@ class SignalCliRestApi(object):
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        received: list = []
-        try:
-            async with websockets.connect(
-                    ws_url,
-                    additional_headers=self._ws_headers() or None,
-                    ssl=ssl_ctx,
-            ) as websocket:
-                while True:
-                    if max_messages is not None and len(received) >= int(max_messages):
-                        break
+        RECONNECT_DELAY = 2  # seconds between reconnect attempts
 
-                    try:
-                        raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        # "silence" timeout => return what we have so far
-                        break
+        while True:
+            try:
+                async with websockets.connect(
+                        ws_url,
+                        additional_headers=self._ws_headers() or None,
+                        ssl=ssl_ctx,
+                ) as websocket:
+                    while True:
+                        try:
+                            raw = await websocket.recv()
+                        except websockets.exceptions.ConnectionClosedOK:
+                            # Server closed cleanly — reconnect
+                            break
+                        except websockets.exceptions.ConnectionClosedError:
+                            # Unexpected close — reconnect
+                            break
 
-                    try:
-                        received.append(json.loads(raw))
-                    except json.JSONDecodeError:
-                        # Keep behavior conservative: ignore malformed frames
-                        continue
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
 
-        except Exception as exc:
-            raise_from(
-                SignalCliRestApiError("Couldn't receive Signal Messenger data via websocket"),
-                exc,
+                        await self._ws_queue.put(msg)
+
+            except asyncio.CancelledError:
+                # stop_ws_listener() cancelled the task — exit cleanly
+                return
+            except Exception:
+                pass  # network error etc. — fall through to reconnect delay
+
+            # Wait before reconnecting, but remain cancellable
+            try:
+                await asyncio.sleep(RECONNECT_DELAY)
+            except asyncio.CancelledError:
+                return
+
+    def start_ws_listener(
+            self,
+            ignore_attachments: bool = False,
+            ignore_stories: bool = False,
+            send_read_receipts: bool = False,
+    ) -> None:
+        """
+        Start the persistent WebSocket background listener (json-rpc mode only).
+
+        Opens a dedicated event loop in a daemon thread. Incoming messages are
+        buffered in an internal queue and can be retrieved via receive_ws() or
+        receive() at any time.
+
+        Calling this method a second time with the same parameters is a no-op.
+        To restart with different parameters call stop_ws_listener() first.
+        """
+        new_params = {
+            "ignore_attachments": ignore_attachments,
+            "ignore_stories": ignore_stories,
+            "send_read_receipts": send_read_receipts,
+        }
+
+        # Already running with the same params — nothing to do
+        if (
+            self._ws_thread is not None
+            and self._ws_thread.is_alive()
+            and self._ws_listener_params == new_params
+        ):
+            return
+
+        # If running with different params, stop first
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            self.stop_ws_listener()
+
+        def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        loop = asyncio.new_event_loop()
+        self._ws_loop = loop
+        self._ws_queue = asyncio.Queue()  # type: ignore[assignment]
+        self._ws_listener_params = new_params
+
+        self._ws_thread = threading.Thread(target=_run_loop, args=(loop,), daemon=True)
+        self._ws_thread.start()
+
+        asyncio.run_coroutine_threadsafe(
+            self._ws_listener(**new_params),
+            loop,
+        )
+
+    def stop_ws_listener(self) -> None:
+        """Stop the background WebSocket listener and close the event loop."""
+        if self._ws_loop is None:
+            return
+
+        # Cancel all running tasks in the background loop
+        for task in asyncio.all_tasks(self._ws_loop):
+            self._ws_loop.call_soon_threadsafe(task.cancel)
+
+        self._ws_loop.call_soon_threadsafe(self._ws_loop.stop)
+
+        if self._ws_thread is not None:
+            self._ws_thread.join(timeout=5)
+
+        self._ws_loop = None
+        self._ws_thread = None
+        self._ws_queue = None
+        self._ws_listener_params = {}
+
+    def receive_ws(
+            self,
+            max_messages: int | None = None,
+            timeout: int = 1,
+    ) -> list:
+        """
+        Drain buffered messages from the WebSocket listener queue.
+
+        The persistent connection is managed by start_ws_listener(). This method
+        only reads from the internal buffer — it does not open or close any
+        connection.
+
+        Collects messages until:
+          - max_messages is reached, OR
+          - the queue is empty for `timeout` seconds
+
+        Args:
+            max_messages (int, optional): Maximum number of messages to return.
+            timeout (int): Seconds to wait for the next message before returning.
+
+        Returns:
+            list: Buffered message envelopes received since the last call.
+        """
+        if self._ws_queue is None or self._ws_loop is None:
+            raise SignalCliRestApiError(
+                "WebSocket listener is not running. Call start_ws_listener() first."
             )
 
-        return received
+        async def _drain() -> list:
+            collected: list = []
+            while True:
+                if max_messages is not None and len(collected) >= int(max_messages):
+                    break
+                try:
+                    msg = await asyncio.wait_for(self._ws_queue.get(), timeout=timeout)
+                    collected.append(msg)
+                except asyncio.TimeoutError:
+                    break
+            return collected
+
+        future = asyncio.run_coroutine_threadsafe(_drain(), self._ws_loop)
+        try:
+            return future.result(timeout=timeout + 5)
+        except Exception as exc:
+            raise_from(
+                SignalCliRestApiError("Couldn't read from WebSocket message buffer"),
+                exc,
+            )
 
     def receive(
         self,
@@ -527,23 +655,15 @@ class SignalCliRestApi(object):
             list: List of messages
         """
         if self._mode == "json-rpc":
-            # If we're already inside an event loop, we can't asyncio.run().
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return asyncio.run(
-                    self.receive_ws(
-                        ignore_attachments=ignore_attachments,
-                        ignore_stories=ignore_stories,
-                        send_read_receipts=send_read_receipts,
-                        max_messages=max_messages,
-                        timeout=timeout,
-                    )
-                )
-            raise SignalCliRestApiError(
-                "receive() cannot be called from inside a running event loop in json-rpc mode. "
-                "Use: await receive_ws(...) instead."
+            # Auto-start the persistent listener on first call.
+            # The listener keeps the connection alive between receive() calls so
+            # no messages are lost while the caller is busy processing.
+            self.start_ws_listener(
+                ignore_attachments=ignore_attachments,
+                ignore_stories=ignore_stories,
+                send_read_receipts=send_read_receipts,
             )
+            return self.receive_ws(max_messages=max_messages, timeout=timeout)
 
         params = {
             "ignore_attachments": ignore_attachments,
